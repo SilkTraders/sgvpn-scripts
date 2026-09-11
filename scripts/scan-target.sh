@@ -134,8 +134,8 @@ download_scanner() {
     base="https://github.com/XTLS/RealiTLScanner/releases/latest/download"
 
     case "$OS/$ARCH" in
-        Linux/x86_64)          asset="RealiTLScanner-linux-64";;
-        Linux/aarch64|Linux/arm64) asset="RealiTLScanner-linux-arm64-v8a";;
+        Linux/x86_64)          asset="RealiTLScanner-linux-amd64";;
+        Linux/aarch64|Linux/arm64) asset="RealiTLScanner-linux-arm64";;
         Darwin/arm64)          asset="RealiTLScanner-darwin-arm64-v8a";;
         Darwin/x86_64)         asset="RealiTLScanner-darwin-64";;
         *) echo "${C_R}❌ Неизвестная платформа $OS/$ARCH${C_0}"; return 1;;
