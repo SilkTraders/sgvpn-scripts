@@ -66,7 +66,7 @@ fetch() {
 
 cmd_install() {
     [[ "$EUID" -eq 0 ]] || die "install требует root. Запустите: sudo -E mynode install (флаг -E сохраняет MYNODE_PANEL_IP при переходе в root)"
-    local tmp; tmp="$(mktemp --suffix=.sh)"
+    local tmp; tmp="$(mktemp)"
     say "Загрузка install-node.sh (${GH_REF})..."
     fetch "scripts/install-node.sh" "$tmp" || die "Не удалось скачать install-node.sh"
     chmod +x "$tmp"
@@ -77,7 +77,7 @@ cmd_install() {
 }
 
 cmd_scan() {
-    local tmp; tmp="$(mktemp --suffix=.sh)"
+    local tmp; tmp="$(mktemp)"
     say "Загрузка scan-target.sh (${GH_REF})..."
     fetch "scripts/scan-target.sh" "$tmp" || die "Не удалось скачать scan-target.sh"
     chmod +x "$tmp"
@@ -88,7 +88,7 @@ cmd_scan() {
 }
 
 cmd_self_install() {
-    local tmp; tmp="$(mktemp --suffix=.sh)"
+    local tmp; tmp="$(mktemp)"
     say "Загрузка mynode.sh (${GH_REF})..."
     fetch "mynode.sh" "$tmp" || die "Не удалось скачать mynode.sh"
     chmod +x "$tmp"
@@ -117,7 +117,7 @@ cmd_self_install() {
 }
 
 cmd_update() {
-    local tmp; tmp="$(mktemp --suffix=.sh)"
+    local tmp; tmp="$(mktemp)"
     fetch "mynode.sh" "$tmp" || die "Не удалось скачать актуальную версию"
     chmod +x "$tmp"
 
