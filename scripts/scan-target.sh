@@ -31,8 +31,8 @@ KEEP_CSV=1
 
 WORKDIR="$(pwd)"
 CSV="$WORKDIR/results.csv"
-SCANNER="$WORKDIR/RealiTLScanner"
 TMPD="$(mktemp -d)"
+SCANNER="$TMPD/RealiTLScanner"
 trap 'rm -rf "$TMPD"' EXIT
 
 C_G=$'\e[0;32m'; C_Y=$'\e[1;33m'; C_R=$'\e[0;31m'; C_D=$'\e[1;30m'; C_0=$'\e[0m'
@@ -489,35 +489,53 @@ echo ""
 # =============================================================================
 
 echo "🏆 ЛУЧШИЕ КАНДИДАТЫ НА REALITY TARGET"
-echo "--------------------------------------------------------------------------------------------------"
-printf " %-6s | %-6s | %-5s | %-6s | %-9s | %-32s | %-15s\n" \
-       "SCORE" "PING" "OCSP" "CERT" "DNS" "SNI (DOMAIN)" "IP"
-echo "--------------------------------------------------------------------------------------------------"
+
+if [[ -s "$RESULT_FILE" ]]; then
+    # Ширина SNI рассчитывается по реальным доменам из выводимых строк.
+    # Домены НИКОГДА не обрезаются.
+    DOM_WIDTH="$(sort -k1,1nr -k2,2n "$RESULT_FILE" \
+        | awk -F'\t' -v top="$TOP_N" '!seen[$9]++ { if (++n <= top && length($9) > max) max=length($9) } END { if (max < 12) max=12; print max }')"
+else
+    DOM_WIDTH=12
+fi
+    TOTAL_WIDTH=$((DOM_WIDTH + 66))
+    printf -v SEP '%*s' "$TOTAL_WIDTH" ''
+    SEP="${SEP// /-}"
+
+    printf '%s\n' "$SEP"
+    printf " %-6s | %-6s | %-5s | %-6s | %-9s | %-${DOM_WIDTH}s | %-15s\n" \
+           "SCORE" "PING" "OCSP" "CERT" "DNS" "SNI (DOMAIN)" "IP"
+    printf '%s\n' "$SEP"
 
 if [[ -s "$RESULT_FILE" ]]; then
     sort -k1,1nr -k2,2n "$RESULT_FILE" | awk -F'\t' '!seen[$9]++' | head -n "$TOP_N" \
     | while IFS=$'\t' read -r score lat ocsp cert http dns wl_sni wl_ip dom ip; do
-        ping_s="${lat}ms"; [[ "$lat" == "9999" ]] && ping_s="—"
+        # В таблице используем только ASCII-значения фиксированной ширины.
+        # Это исключает визуальный сдвиг колонок из-за Unicode-символов.
+        ping_s="${lat}ms"; [[ "$lat" == "9999" ]] && ping_s="N/A"
 
         case "$dns" in
             EXACT)     c_dns="$C_G"; dns_s="EXACT";;
             SUBNET)    c_dns="$C_G"; dns_s="SUBNET";;
-            ELSEWHERE) c_dns="$C_R"; dns_s="ФАНТОМ";;
+            ELSEWHERE) c_dns="$C_R"; dns_s="PHANTOM";;
             *)         c_dns="$C_R"; dns_s="NXDOMAIN";;
         esac
+
+        # Домен выводится ПОЛНОСТЬЮ — ничего не обрезаем.
+        dom_s="$dom"
 
         c_dom="$C_0"; [[ "$wl_sni" == "1" ]] && c_dom="$C_G"
         c_ip="$C_0";  [[ "$wl_ip"  == "1" ]] && c_ip="$C_G"
         c_cert="$C_0"; [[ "$cert" == "SOON" ]] && c_cert="$C_Y"
 
-        printf " %-6s | %-6s | %-5s | ${c_cert}%-6s${C_0} | ${c_dns}%-9s${C_0} | ${c_dom}%-32s${C_0} | ${c_ip}%-15s${C_0}\n" \
-               "$score" "$ping_s" "$ocsp" "$cert" "$dns_s" "$dom" "$ip"
+        printf " %-6s | %-6s | %-5s | ${c_cert}%-6s${C_0} | ${c_dns}%-9s${C_0} | ${c_dom}%-${DOM_WIDTH}s${C_0} | ${c_ip}%-15s${C_0}\n" \
+               "$score" "$ping_s" "$ocsp" "$cert" "$dns_s" "$dom_s" "$ip"
     done
 else
     echo " Ни одного кандидата не прошло проверки."
 fi
 
-echo "--------------------------------------------------------------------------------------------------"
+printf "%s\n" "$SEP"
 echo ""
 echo "Как читать:"
 echo "  ${C_G}Зелёный домен${C_0}  — есть в белом списке ТСПУ по SNI (доступен при шатдаунах)"
