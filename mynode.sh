@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  mynode — единая точка входа для скриптов SG VPN
+#  mynode — единая точка входа для скриптов SG VPN  (v2)
+#
+#  Изменения против v1:
+#   - Временные файлы гарантированно чистятся при ЛЮБОМ выходе (успех, error
+#     через set -e, Ctrl+C) — раньше "rm -f "$tmp"" после "bash "$tmp" "$@""
+#     не выполнялся при ненулевом коде выхода из-за set -e, и tmp-файлы
+#     копились в /tmp при каждой неудачной установке/сканировании.
+#   - install-node.sh теперь принимает флаг --panel-ip=IP как альтернативу
+#     переменной MYNODE_PANEL_IP — на случай, если sudo -E на конкретном
+#     хосте не пробрасывает переменные окружения (сурового sudoers).
+#     Задокументировано в usage() и подсказке при отсутствии root.
 #
 #  Подкоманды:
 #    install         Настройка и установка Linux-ноды (запускать на сервере, root)
@@ -10,7 +20,7 @@
 #
 #  Сам этот файл не содержит ничего чувствительного и может свободно лежать
 #  в публичном репозитории — реальные IP и ключи передаются переменными
-#  окружения в момент запуска, а не хранятся в тексте скрипта.
+#  окружения или флагами в момент запуска, а не хранятся в тексте скрипта.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -32,6 +42,14 @@ say()  { echo "${C_OK}$*${C_OFF}"; }
 warn() { echo "${C_WARN}⚠️  $*${C_OFF}"; }
 die()  { echo "${C_ERR}❌ $*${C_OFF}"; exit 1; }
 
+# --- Гарантированная очистка временных файлов ---
+# Не "local tmp" внутри функций: под set -e при ненулевом коде выхода
+# команда после "bash "$TMP_FILE" ..." не выполняется, и локальная
+# переменная всё равно исчезает по возврату из функции — trap на EXIT
+# срабатывает независимо от того, как именно скрипт завершился.
+TMP_FILE=""
+trap 'rm -f "${TMP_FILE:-}"' EXIT
+
 usage() {
 cat <<USAGE
 mynode — управление нодами SG VPN
@@ -43,8 +61,14 @@ mynode — управление нодами SG VPN
   update              Обновить локальную копию до текущей версии из репозитория
   help                Эта справка
 
+Опции install:
+  --panel-ip=IP        IP панели — альтернатива переменной MYNODE_PANEL_IP.
+                        Полезно, если sudo -E на этом хосте не пробрасывает
+                        переменные окружения (см. примеры ниже).
+
 Примеры:
   MYNODE_PANEL_IP=1.2.3.4 sudo -E mynode install
+  sudo -E mynode install --panel-ip=1.2.3.4
   mynode scan --subnet 91.234.56.0/24
 
 Первый запуск (без установки):
@@ -65,40 +89,34 @@ fetch() {
 }
 
 cmd_install() {
-    [[ "$EUID" -eq 0 ]] || die "install требует root. Запустите: sudo -E mynode install (флаг -E сохраняет MYNODE_PANEL_IP при переходе в root)"
-    local tmp; tmp="$(mktemp)"
+    [[ "$EUID" -eq 0 ]] || die "install требует root. Запустите: sudo -E mynode install (флаг -E сохраняет MYNODE_PANEL_IP при переходе в root; если на этом хосте всё равно не долетает — используйте sudo -E mynode install --panel-ip=IP)"
     say "Загрузка install-node.sh (${GH_REF})..."
-    fetch "scripts/install-node.sh" "$tmp" || die "Не удалось скачать install-node.sh"
-    chmod +x "$tmp"
-    bash "$tmp" "$@"
-    local rc=$?
-    rm -f "$tmp"
-    return "$rc"
+    TMP_FILE="$(mktemp)"
+    fetch "scripts/install-node.sh" "$TMP_FILE" || die "Не удалось скачать install-node.sh"
+    chmod +x "$TMP_FILE"
+    bash "$TMP_FILE" "$@"
 }
 
 cmd_scan() {
-    local tmp; tmp="$(mktemp)"
     say "Загрузка scan-target.sh (${GH_REF})..."
-    fetch "scripts/scan-target.sh" "$tmp" || die "Не удалось скачать scan-target.sh"
-    chmod +x "$tmp"
-    bash "$tmp" "$@"
-    local rc=$?
-    rm -f "$tmp"
-    return "$rc"
+    TMP_FILE="$(mktemp)"
+    fetch "scripts/scan-target.sh" "$TMP_FILE" || die "Не удалось скачать scan-target.sh"
+    chmod +x "$TMP_FILE"
+    bash "$TMP_FILE" "$@"
 }
 
 cmd_self_install() {
-    local tmp; tmp="$(mktemp)"
     say "Загрузка mynode.sh (${GH_REF})..."
-    fetch "mynode.sh" "$tmp" || die "Не удалось скачать mynode.sh"
-    chmod +x "$tmp"
+    TMP_FILE="$(mktemp)"
+    fetch "mynode.sh" "$TMP_FILE" || die "Не удалось скачать mynode.sh"
+    chmod +x "$TMP_FILE"
 
     local dest_dir; dest_dir="$(dirname "$SELF_DEST")"
     if [[ -w "$dest_dir" ]]; then
-        mv "$tmp" "$SELF_DEST"
+        mv "$TMP_FILE" "$SELF_DEST"
     elif command -v sudo >/dev/null 2>&1; then
         say "Нужны права на запись в $dest_dir — запрошу sudo."
-        sudo mv "$tmp" "$SELF_DEST"
+        sudo mv "$TMP_FILE" "$SELF_DEST"
         sudo chmod +x "$SELF_DEST"
     else
         die "Нет прав на запись в $dest_dir и нет sudo. Скопируйте файл вручную."
@@ -117,31 +135,31 @@ cmd_self_install() {
 }
 
 cmd_update() {
-    local tmp; tmp="$(mktemp)"
-    fetch "mynode.sh" "$tmp" || die "Не удалось скачать актуальную версию"
-    chmod +x "$tmp"
+    TMP_FILE="$(mktemp)"
+    fetch "mynode.sh" "$TMP_FILE" || die "Не удалось скачать актуальную версию"
+    chmod +x "$TMP_FILE"
 
-    if [[ -f "$SELF_DEST" ]] && diff -q "$SELF_DEST" "$tmp" >/dev/null 2>&1; then
+    if [[ -f "$SELF_DEST" ]] && diff -q "$SELF_DEST" "$TMP_FILE" >/dev/null 2>&1; then
         say "Уже установлена актуальная версия (${GH_REF})."
-        rm -f "$tmp"; return 0
+        return 0
     fi
 
     if [[ -f "$SELF_DEST" ]]; then
         warn "Найдены отличия от установленной версии:"
-        diff "$SELF_DEST" "$tmp" || true
+        diff "$SELF_DEST" "$TMP_FILE" || true
         echo ""
     fi
 
     read -r -p "Установить эту версию как $SELF_DEST? (y/N): " ans
     if ! [[ "$ans" =~ ^[Yy]$ ]]; then
-        rm -f "$tmp"; say "Отменено."; return 0
+        say "Отменено."; return 0
     fi
 
     local dest_dir; dest_dir="$(dirname "$SELF_DEST")"
     if [[ -w "$dest_dir" ]]; then
-        mv "$tmp" "$SELF_DEST"
+        mv "$TMP_FILE" "$SELF_DEST"
     else
-        sudo mv "$tmp" "$SELF_DEST"
+        sudo mv "$TMP_FILE" "$SELF_DEST"
     fi
     chmod +x "$SELF_DEST" 2>/dev/null || sudo chmod +x "$SELF_DEST"
     say "Обновлено до ${GH_REF}."

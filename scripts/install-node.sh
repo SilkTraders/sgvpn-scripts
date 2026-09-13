@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v3)
+#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v4)
 #
-#  Изменения против v2:
-#   - IPv6 больше НЕ отключается на уровне ядра (см. блок RECOMMENDATIONS)
-#   - Порт ноды (панель <-> нода) открывается ТОЛЬКО для IP панели
-#   - Порт 80 по умолчанию закрыт: при маскировке под чужие сайты он не нужен
-#   - Добавлен cron на "docker compose restart" в окно 03:00-05:00 МСК
-#   - Плановый ребут разведён по случайной минуте, чтобы ноды не падали разом
-#   - Добавлена утилита диагностики /usr/local/bin/node-health
+#  Изменения против v3:
+#   - Проверка SSH-ключа: сначала строгий формат-чек (тип ключа + base64),
+#     затем ssh-keygen -l -f — одиночный мусорный символ больше не проходит
+#   - Вопросы про порт 80 и 8443 убраны, вместо них — свободный список
+#     дополнительных портов на открытие (см. EXTRA_PORTS)
+#   - docker-compose.yml содержит в environment только GOGC/GOMEMLIMIT,
+#     подобранные скриптом; блок для переменных панели убран из шаблона
+#   - Итоговый отчёт: логин и порт SSH выводятся отдельными строками,
+#     а не готовой командой подключения
+#   - Добавлен флаг --panel-ip=IP как альтернатива переменной MYNODE_PANEL_IP
+#     (см. примечание в блоке ПРЕДПОЛЁТНЫЕ ПРОВЕРКИ)
 # =============================================================================
 
 set -Eeuo pipefail
@@ -26,8 +30,17 @@ die()  { echo "${C_ERR}❌ $*${C_OFF}"; exit 1; }
 # Реальный IP НЕ хардкодится здесь — этот файл лежит в публичном репозитории.
 # Передайте его переменной окружения прямо в команде запуска:
 #   MYNODE_PANEL_IP=1.2.3.4 bash <(curl -fsSL .../mynode.sh) install
-# Если переменная не задана, скрипт просто спросит IP без варианта по умолчанию —
+# Либо флагом при прямом запуске этого файла: install-node.sh --panel-ip=1.2.3.4
+# (флаг полезен, если переменная окружения не долетает через обёртку/sudo —
+#  аргументы командной строки переживают такие хопы надёжнее, чем env).
+# Если ничего не задано, скрипт просто спросит IP без варианта по умолчанию —
 # ничего не сломается, будет на одно нажатие Enter больше.
+for arg in "$@"; do
+    case "$arg" in
+        --panel-ip=*) MYNODE_PANEL_IP="${arg#*=}" ;;
+    esac
+done
+
 DEFAULT_PANEL_IP="${MYNODE_PANEL_IP:-}"
 DEFAULT_NODE_PORT="${MYNODE_NODE_PORT:-2222}"
 
@@ -82,16 +95,29 @@ while true; do
   else break; fi
 done
 
+# --- SSH-ключ ---
+# Формат-чек ДО ssh-keygen: строка обязана начинаться с известного типа ключа
+# и base64-данных. Так одиночный мусорный символ (например, случайно
+# вставленная буква) отсекается сразу, даже если бы ssh-keygen на пустом/
+# однобайтовом файле почему-то не дал ошибку.
+KEY_TYPE_RE='^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+=*([[:space:]].*)?$'
+
 while true; do
   read -r -p "Публичный SSH-ключ (содержимое .pub): " SSH_PUB_KEY
   SSH_PUB_KEY="$(echo "$SSH_PUB_KEY" | xargs || true)"
+
+  if ! [[ "$SSH_PUB_KEY" =~ $KEY_TYPE_RE ]]; then
+      warn "Не похоже на публичный SSH-ключ (нет типа ключа и/или base64-данных). Скопирована ли строка целиком?"
+      continue
+  fi
+
   TMP_KEY="$(mktemp)"; printf '%s\n' "$SSH_PUB_KEY" > "$TMP_KEY"
   if ssh-keygen -l -f "$TMP_KEY" >/dev/null 2>&1; then
       say "Ключ принят: $(ssh-keygen -l -f "$TMP_KEY")"
       rm -f "$TMP_KEY"; break
   fi
   rm -f "$TMP_KEY"
-  warn "Ключ не прошёл проверку. Скопирована ли строка целиком?"
+  warn "Ключ не прошёл проверку ssh-keygen. Скопирована ли строка целиком?"
 done
 
 # --- Порт связи панели с нодой ---
@@ -111,7 +137,7 @@ done
 
 echo ""
 if [[ -n "$DEFAULT_PANEL_IP" ]]; then
-    echo "IP панели по умолчанию: $DEFAULT_PANEL_IP  (передан через MYNODE_PANEL_IP)"
+    echo "IP панели по умолчанию: $DEFAULT_PANEL_IP  (передан через MYNODE_PANEL_IP/--panel-ip)"
 fi
 while true; do
   if [[ -n "$DEFAULT_PANEL_IP" ]]; then
@@ -133,37 +159,24 @@ while true; do
   warn "Некорректный IPv4-адрес."
 done
 
-# --- Порт 8443 (магистраль между нодами) ---
+# --- Дополнительные порты ---
 echo ""
-while true; do
-  read -r -p "Открыть 8443/tcp для магистрали между нодами? (y/n): " ANS
-  case "$ANS" in
-    [Yy]*|[Дд]*) OPEN_8443=true; break;;
-    [Nn]*|[Нн]*) OPEN_8443=false; break;;
-    *) warn "Ответьте y или n.";;
-  esac
-done
-
-if [ "$OPEN_8443" = true ]; then
-    echo ""
-    echo "Можно ограничить 8443 конкретным IP второй ноды — это безопаснее,"
-    echo "чем открывать порт всему интернету. Оставьте пустым, чтобы открыть всем."
-    read -r -p "IP парной ноды (Enter = открыть всем): " PEER_IP
-    PEER_IP="${PEER_IP:-}"
+echo "=== Дополнительные порты ==="
+echo "Уже открываются автоматически: SSH-порт (см. ниже), 443/tcp (Xray),"
+echo "$NODE_PORT/tcp только с IP панели ($PANEL_IP)."
+read -r -p "Ещё какие TCP-порты открыть всем (через запятую, например 80,8443; пусто = не нужно): " EXTRA_PORTS_INPUT
+EXTRA_PORTS=()
+if [ -n "$EXTRA_PORTS_INPUT" ]; then
+    IFS=',' read -r -a RAW_PORTS <<< "$EXTRA_PORTS_INPUT"
+    for p in "${RAW_PORTS[@]}"; do
+        p="$(echo "$p" | xargs)"
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+            EXTRA_PORTS+=("$p")
+        else
+            [ -n "$p" ] && warn "Порт '$p' некорректен, пропущен."
+        fi
+    done
 fi
-
-# --- Порт 80 ---
-echo ""
-echo "Порт 80 нужен только для выпуска сертификатов по HTTP-01."
-echo "При маскировке под ЧУЖИЕ сайты веб-сервера на ноде нет — порт не нужен."
-while true; do
-  read -r -p "Открыть 80/tcp? (y/N): " ANS
-  case "$ANS" in
-    [Yy]*|[Дд]*) OPEN_80=true; break;;
-    [Nn]*|[Нн]*|"") OPEN_80=false; break;;
-    *) warn "Ответьте y или n.";;
-  esac
-done
 
 # --- Обслуживание ---
 echo ""
@@ -487,15 +500,10 @@ ufw deny  443/udp comment 'Block QUIC'
 # через которую управляется Xray.
 ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'Panel API'
 
-if [ "$OPEN_8443" = true ]; then
-    if [ -n "${PEER_IP:-}" ]; then
-        ufw allow from "$PEER_IP" to any port 8443 proto tcp comment 'Bridge peer'
-    else
-        ufw allow 8443/tcp comment 'Bridge (open)'
-    fi
-fi
-
-[ "$OPEN_80" = true ] && ufw allow 80/tcp comment 'ACME HTTP-01'
+# Дополнительные порты, заданные на шаге сбора ввода (открываются всем).
+for p in "${EXTRA_PORTS[@]}"; do
+    ufw allow "$p"/tcp comment 'Custom port'
+done
 
 ufw limit 22/tcp comment 'SSH legacy - закрыть после проверки'
 ufw --force enable >/dev/null
@@ -663,17 +671,16 @@ echo "CPU:              $CPU_CORES ядер"
 echo "RAM:              ${RAM_MB} MB"
 echo ""
 echo "--- Доступ ---"
-echo "SSH:              ssh -p $SSH_PORT $USER_NAME@$SERVER_IP"
+echo "Логин:            $USER_NAME"
+echo "Порт SSH:         $SSH_PORT"
 echo ""
 echo "--- Firewall ---"
 echo "443/tcp           открыт (Xray)"
 echo "443/udp           заблокирован (QUIC)"
 echo "$NODE_PORT/tcp           только с $PANEL_IP (панель)"
-if [ "$OPEN_8443" = true ]; then
-    if [ -n "${PEER_IP:-}" ]; then echo "8443/tcp          только с ${PEER_IP}"
-    else echo "8443/tcp          открыт всем — сузьте до IP парной ноды"; fi
+if [ "${#EXTRA_PORTS[@]}" -gt 0 ]; then
+    echo "Доп. порты:       ${EXTRA_PORTS[*]}/tcp (открыты всем)"
 fi
-[ "$OPEN_80" = true ] && echo "80/tcp            открыт (ACME)"
 echo ""
 echo "--- Обслуживание ---"
 echo "Рестарт контейнера: $RESTART_DESC"
@@ -760,8 +767,9 @@ cd /opt/remnanode
 if [ -f docker-compose.yml ] && [ -s docker-compose.yml ]; then
     say "docker-compose.yml уже существует, открываем на правку."
 else
-    # Имена переменных окружения намеренно не придумываются —
-    # берите блок ровно тот, что выдаёт панель при добавлении ноды.
+    # В environment — только параметры, подобранные скриптом по железу
+    # (GOGC/GOMEMLIMIT). Никаких плейсхолдеров под переменные панели
+    # здесь больше нет — при необходимости добавьте их вручную в nano ниже.
     cat > docker-compose.yml <<EOF
 services:
   remnanode:
@@ -773,30 +781,23 @@ services:
     environment:
       - GOGC=$GOGC
       - GOMEMLIMIT=$GOMEM
-      # === ВСТАВЬТЕ СЮДА ПЕРЕМЕННЫЕ ИЗ ПАНЕЛИ ===
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "5"
 EOF
-    say "Создан каркас с подставленными GOGC и GOMEMLIMIT."
+    say "Создан docker-compose.yml с GOGC=$GOGC и GOMEMLIMIT=$GOMEM."
 fi
 
 echo ""
-warn "Откроется nano. Вставьте переменные из панели вместо плейсхолдера."
+warn "Откроется nano. Если нужны дополнительные переменные (например, из панели) —"
+warn "добавьте их сами; если нет — просто закройте файл."
 warn "Сохранение: Ctrl+O, Enter, Ctrl+X."
 read -n 1 -s -r -p "Нажмите любую клавишу..."
 echo ""
 
 nano docker-compose.yml
-
-if grep -q "ВСТАВЬТЕ СЮДА" docker-compose.yml; then
-    warn "Плейсхолдер остался — контейнер не запускаем."
-    echo "Отредактируйте: cd /opt/remnanode && nano docker-compose.yml"
-    echo "Затем: docker compose up -d"
-    exit 0
-fi
 
 docker compose config >/dev/null || die "docker-compose.yml невалиден."
 docker compose up -d
