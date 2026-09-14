@@ -741,11 +741,6 @@ cat "$REPORT"
 echo ""
 echo "====================================================================="
 warn "НЕ ЗАКРЫВАЙТЕ ЭТУ СЕССИЮ."
-echo "Откройте ВТОРОЙ терминал и проверьте вход:"
-echo ""
-echo "    ssh -p $SSH_PORT $USER_NAME@$SERVER_IP"
-echo ""
-echo "====================================================================="
 read -r -p "Вход работает? Введите YES для закрытия порта 22: " CONFIRM
 
 if [ "$CONFIRM" = "YES" ]; then
@@ -765,12 +760,14 @@ mkdir -p /opt/remnanode
 cd /opt/remnanode
 
 if [ -f docker-compose.yml ] && [ -s docker-compose.yml ]; then
-    say "docker-compose.yml уже существует, открываем на правку."
-else
-    # В environment — только параметры, подобранные скриптом по железу
-    # (GOGC/GOMEMLIMIT). Никаких плейсхолдеров под переменные панели
-    # здесь больше нет — при необходимости добавьте их вручную в nano ниже.
-    cat > docker-compose.yml <<EOF
+    cp -a docker-compose.yml "docker-compose.yml.bak.$(date +%s)"
+    say "Существующий docker-compose.yml сохранён в бэкап, пишем заново."
+fi
+
+# В environment — только параметры, подобранные скриптом по железу
+# (GOGC/GOMEMLIMIT). Никаких плейсхолдеров под переменные панели
+# здесь больше нет — при необходимости добавьте их вручную в nano ниже.
+cat > docker-compose.yml <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -787,8 +784,7 @@ services:
         max-size: "50m"
         max-file: "5"
 EOF
-    say "Создан docker-compose.yml с GOGC=$GOGC и GOMEMLIMIT=$GOMEM."
-fi
+say "Создан docker-compose.yml с GOGC=$GOGC и GOMEMLIMIT=$GOMEM."
 
 echo ""
 warn "Откроется nano. Если нужны дополнительные переменные (например, из панели) —"
@@ -804,5 +800,3 @@ docker compose up -d
 
 say "Контейнер запущен. Отчёт: $REPORT"
 say "Диагностика: node-health"
-echo "Логи (выход — Ctrl+C):"
-docker compose logs -f -t
