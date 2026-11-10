@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v4)
+#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v5)
 #
-#  Изменения против v3:
+#  Изменения против v4:
+#   - Мост (роль 2): спрашивается порт инбаунда моста и IP входящих нод.
+#     Порт моста открывается в UFW ТОЛЬКО для этих IP. Раньше скрипт его
+#     не открывал вовсе: при default deny мост молча дропал SYN от RU-нод,
+#     а панель показывала ноду "зелёной".
+#   - Мост больше не открывает 443/tcp всему миру — ему это не нужно.
+#   - Утилита bridge-allow (на мосту): добавить/убрать/показать входящие ноды
+#     без ручного синтаксиса ufw.
+#   - Утилита bridge-check (на любой ноде): проверить с входящей ноды, что
+#     мост доступен по TCP и (опционально) отвечает TLS 1.3 с нужным SNI.
+#     Работает без nc — через /dev/tcp встроенного bash.
+#   - Отчёт: порт инбаунда моста берётся из ввода (раньше было жёстко "8443").
+#   - SSH: если sshd не переехал на новый порт, 22 больше не закрывается по
+#     YES (раньше SSH_PORT_OK вычислялся, но не использовался — риск
+#     потерять доступ к серверу).
+#   - Цветное приглашение терминала: user@host зелёный у пользователя,
+#     красный у root.
+#   - docker-compose.yml открывается ПУСТЫМ под вставку из панели.
+#     GOGC/GOMEMLIMIT вынесены в docker-compose.override.yml (Compose
+#     объединяет его автоматически). Пустой файл и сервис не с именем
+#     remnanode — ловятся до запуска.
+#
+#  Изменения v4 против v3:
 #   - Проверка SSH-ключа: сначала строгий формат-чек (тип ключа + base64),
 #     затем ssh-keygen -l -f — одиночный мусорный символ больше не проходит
 #   - Вопросы про порт 80 и 8443 убраны, вместо них — свободный список
@@ -26,6 +48,19 @@ inf()  { echo "${C_INF}$*${C_OFF}"; }
 warn() { echo "${C_WARN}⚠️  $*${C_OFF}"; }
 die()  { echo "${C_ERR}❌ $*${C_OFF}"; exit 1; }
 
+# Проверка IPv4. 10# — чтобы октет с ведущим нулём ("08") не считался
+# восьмеричным числом внутри (( )).
+valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a _OCT <<< "$ip"
+    for o in "${_OCT[@]}"; do (( 10#$o <= 255 )) || return 1; done
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 # --- IP панели управления ---
 # Реальный IP НЕ хардкодится здесь — этот файл лежит в публичном репозитории.
 # Передайте его переменной окружения прямо в команде запуска:
@@ -43,6 +78,7 @@ done
 
 DEFAULT_PANEL_IP="${MYNODE_PANEL_IP:-}"
 DEFAULT_NODE_PORT="${MYNODE_NODE_PORT:-2222}"
+DEFAULT_BRIDGE_PORT="${MYNODE_BRIDGE_PORT:-2087}"
 
 # =============================================================================
 #  ПРЕДПОЛЁТНЫЕ ПРОВЕРКИ
@@ -149,22 +185,63 @@ while true; do
   else
       read -r -p "Введите IP панели: " PANEL_IP
   fi
-  # Простая проверка формата IPv4
-  if [[ "$PANEL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-      VALID=true
-      IFS='.' read -r -a OCT <<< "$PANEL_IP"
-      for o in "${OCT[@]}"; do [ "$o" -le 255 ] || VALID=false; done
-      [ "$VALID" = true ] && { say "IP панели: $PANEL_IP"; break; }
+  if valid_ipv4 "$PANEL_IP"; then
+      say "IP панели: $PANEL_IP"; break
   fi
   warn "Некорректный IPv4-адрес."
 done
 
+# --- Мост: порт инбаунда и входящие ноды ---
+# Порт моста НЕ открывается всему миру: на него ходят только наши RU-ноды.
+# Открытый всем порт моста = лишняя поверхность для сканеров и пробинга.
+BRIDGE_PORT=""
+ENTRY_IPS=()
+if [ "$NODE_ROLE" = "2" ]; then
+    echo ""
+    echo "=== Мост: порт инбаунда и входящие ноды ==="
+    echo "Порт инбаунда моста откроется ТОЛЬКО для IP входящих нод."
+    echo "Должен совпадать с \"port\" инбаунда моста в профиле Remnawave."
+    echo ""
+    read -r -p "Порт инбаунда моста [$DEFAULT_BRIDGE_PORT]: " BRIDGE_PORT
+    BRIDGE_PORT="${BRIDGE_PORT:-$DEFAULT_BRIDGE_PORT}"
+    while ! valid_port "$BRIDGE_PORT" || [ "$BRIDGE_PORT" = "$NODE_PORT" ]; do
+        warn "Некорректный порт или совпадает с портом панели ($NODE_PORT)."
+        read -r -p "Порт инбаунда моста [$DEFAULT_BRIDGE_PORT]: " BRIDGE_PORT
+        BRIDGE_PORT="${BRIDGE_PORT:-$DEFAULT_BRIDGE_PORT}"
+    done
+
+    read -r -p "IP входящих нод через запятую (пусто = добавлю позже командой bridge-allow): " ENTRY_IPS_INPUT
+    if [ -n "$ENTRY_IPS_INPUT" ]; then
+        IFS=',' read -r -a RAW_IPS <<< "$ENTRY_IPS_INPUT"
+        for ip in "${RAW_IPS[@]}"; do
+            ip="$(echo "$ip" | xargs)"
+            [ -z "$ip" ] && continue
+            if valid_ipv4 "$ip"; then
+                ENTRY_IPS+=("$ip")
+            else
+                warn "IP '$ip' некорректен, пропущен."
+            fi
+        done
+    fi
+    if [ "${#ENTRY_IPS[@]}" -eq 0 ]; then
+        warn "Ни одного IP входящей ноды. Мост будет недоступен, пока не выполните"
+        warn "на нём: sudo bridge-allow <IP_ВХОДЯЩЕЙ_НОДЫ>"
+    fi
+fi
+
 # --- Дополнительные порты ---
 echo ""
 echo "=== Дополнительные порты ==="
-echo "Уже открываются автоматически: SSH-порт (см. ниже), 443/tcp (Xray),"
-echo "$NODE_PORT/tcp только с IP панели ($PANEL_IP)."
-read -r -p "Ещё какие TCP-порты открыть всем (через запятую, например 80,8443; пусто = не нужно): " EXTRA_PORTS_INPUT
+if [ "$NODE_ROLE" = "1" ]; then
+    echo "Уже открываются автоматически: SSH-порт (см. ниже), 443/tcp (Xray),"
+    echo "$NODE_PORT/tcp только с IP панели ($PANEL_IP)."
+else
+    echo "Уже открываются автоматически: SSH-порт (см. ниже),"
+    echo "$BRIDGE_PORT/tcp только с IP входящих нод, $NODE_PORT/tcp только с IP панели ($PANEL_IP)."
+    warn "Мосту обычно НЕ нужны порты, открытые всему интернету."
+    warn "Локальные сервисы (Psiphon на 127.0.0.1:1080 и т.п.) открывать здесь не нужно."
+fi
+read -r -p "Ещё какие TCP-порты открыть ВСЕМ (через запятую, например 80,8443; пусто = не нужно): " EXTRA_PORTS_INPUT
 EXTRA_PORTS=()
 if [ -n "$EXTRA_PORTS_INPUT" ]; then
     IFS=',' read -r -a RAW_PORTS <<< "$EXTRA_PORTS_INPUT"
@@ -197,6 +274,9 @@ while true; do
 done
 
 SSH_PORT="$(shuf -i 20000-60000 -n 1)"
+while [ "$SSH_PORT" = "$NODE_PORT" ] || [ "$SSH_PORT" = "$BRIDGE_PORT" ]; do
+    SSH_PORT="$(shuf -i 20000-60000 -n 1)"
+done
 echo ""
 say "Сгенерирован SSH-порт: $SSH_PORT"
 echo "======================================"
@@ -263,6 +343,24 @@ grep -qxF "$SSH_PUB_KEY" "$USER_HOME/.ssh/authorized_keys" || \
 chmod 700 "$USER_HOME/.ssh"
 chmod 600 "$USER_HOME/.ssh/authorized_keys"
 chown -R "$USER_NAME:$USER_NAME" "$USER_HOME/.ssh"
+
+# --- Цветное приглашение терминала (PS1) ---
+# Обычный пользователь: зелёный user@host. root (sudo -i): КРАСНЫЙ user@host,
+# чтобы сразу было видно, что сессия с полными правами.
+# \$ bash сам превращает в "$" для пользователя и в "#" для root.
+# Маркер sgvpn-custom-ps1 — защита от дублирования при повторном запуске.
+PS1_USER="PS1='\\[\\e[1;32m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\[\\e[1;31m\\]\\\$\\[\\e[0m\\] '"
+PS1_ROOT="PS1='\\[\\e[1;31m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[1;34m\\]\\w\\[\\e[0m\\]\\[\\e[1;31m\\]\\\$\\[\\e[0m\\] '"
+for rc_pair in "$USER_HOME/.bashrc|$PS1_USER" "/root/.bashrc|$PS1_ROOT"; do
+    rc_file="${rc_pair%%|*}"; rc_ps1="${rc_pair#*|}"
+    if [ -f "$rc_file" ] && ! grep -qF "sgvpn-custom-ps1" "$rc_file"; then
+        printf '\n# sgvpn-custom-ps1\n%s\n' "$rc_ps1" >> "$rc_file"
+    fi
+done
+# Без проверки -f: если .bashrc нет, chown падает и set -e обрывает установку.
+if [ -f "$USER_HOME/.bashrc" ]; then
+    chown "$USER_NAME:$USER_NAME" "$USER_HOME/.bashrc"
+fi
 
 # =============================================================================
 #  [4/12] SSH
@@ -493,8 +591,19 @@ ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 
 ufw limit "$SSH_PORT"/tcp comment 'SSH'
-ufw allow 443/tcp comment 'Xray inbound'
-ufw deny  443/udp comment 'Block QUIC'
+
+if [ "$NODE_ROLE" = "1" ]; then
+    ufw allow 443/tcp comment 'Xray inbound'
+    ufw deny  443/udp comment 'Block QUIC'
+else
+    # Мост: порт инбаунда — только для входящих нод. Без этого правила
+    # default deny молча дропает SYN от RU-нод (ни RST, ни ошибки в панели).
+    for ip in "${ENTRY_IPS[@]}"; do
+        ufw allow from "$ip" to any port "$BRIDGE_PORT" proto tcp comment 'Entry node -> bridge'
+    done
+    mkdir -p /etc/sgvpn
+    echo "$BRIDGE_PORT" > /etc/sgvpn/bridge-port
+fi
 
 # Порт ноды — ТОЛЬКО с IP панели. Открытый всему миру API ноды это точка,
 # через которую управляется Xray.
@@ -584,6 +693,81 @@ echo "=============================================="
 HEALTH
 
 chmod +x /usr/local/bin/node-health
+
+# --- bridge-check: ставится на любую ноду, запускается на ВХОДЯЩЕЙ ---
+# Проверяет то, что панель не видит: доходит ли TCP от этой ноды до моста
+# и отвечает ли мост TLS 1.3 с нужным SNI. Без nc — через /dev/tcp bash.
+cat > /usr/local/bin/bridge-check <<'BCHECK'
+#!/usr/bin/env bash
+# Использование: bridge-check <IP_МОСТА> [ПОРТ=2087] [SNI]
+set -uo pipefail
+IP="${1:-}"; PORT="${2:-2087}"; SNI="${3:-}"
+if [ -z "$IP" ]; then
+    echo "Использование: bridge-check <IP_МОСТА> [ПОРТ=2087] [SNI]"
+    echo "Запускать на ВХОДЯЩЕЙ ноде."
+    exit 2
+fi
+
+if timeout 5 bash -c "</dev/tcp/$IP/$PORT" 2>/dev/null; then
+    echo "✓ TCP $IP:$PORT доступен с этой ноды"
+else
+    MY_IP="$(curl -s4 --max-time 5 https://ifconfig.me || echo '<IP_ЭТОЙ_НОДЫ>')"
+    echo "✗ TCP $IP:$PORT недоступен с этой ноды"
+    echo "  Чаще всего — файрвол моста. На мосту выполните:"
+    echo "    sudo bridge-allow $MY_IP"
+    echo "  Если не помогло — проверьте, что Xray на мосту слушает порт:"
+    echo "    ss -tlnp | grep :$PORT"
+    exit 1
+fi
+
+if [ -n "$SNI" ]; then
+    OUT="$(curl -vk -m 10 --resolve "$SNI:$PORT:$IP" "https://$SNI:$PORT" 2>&1 || true)"
+    if grep -q 'TLSv1.3' <<< "$OUT"; then
+        echo "✓ TLS 1.3 с SNI $SNI"
+        grep -m1 'subject:' <<< "$OUT" | sed 's/^\*[[:space:]]*/  /'
+    else
+        echo "✗ TLS 1.3 с SNI $SNI не получен. Последние строки curl:"
+        tail -5 <<< "$OUT" | sed 's/^/  /'
+        echo "  Проверьте на мосту: доступен ли target Reality и отдаёт ли он TLS 1.3."
+        exit 1
+    fi
+fi
+BCHECK
+chmod +x /usr/local/bin/bridge-check
+
+# --- bridge-allow: только на мосту ---
+if [ "$NODE_ROLE" = "2" ]; then
+cat > /usr/local/bin/bridge-allow <<'BALLOW'
+#!/usr/bin/env bash
+# Управление доступом входящих нод к порту моста.
+#   bridge-allow <IP>       открыть порт моста для IP
+#   bridge-allow -d <IP>    закрыть порт моста для IP
+#   bridge-allow -l         показать, для кого открыт
+set -euo pipefail
+[ "$EUID" -eq 0 ] || { echo "Нужен root: sudo bridge-allow ..."; exit 1; }
+PORT="$(cat /etc/sgvpn/bridge-port 2>/dev/null || true)"
+[ -n "$PORT" ] || { echo "Не найден /etc/sgvpn/bridge-port (порт моста)."; exit 1; }
+
+is_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+case "${1:--l}" in
+    -l)
+        ufw status | grep -E "^${PORT}/tcp" || echo "Порт $PORT не открыт ни для одной ноды."
+        ;;
+    -d)
+        IP="${2:-}"; is_ip "$IP" || { echo "Некорректный IP: '$IP'"; exit 1; }
+        ufw delete allow from "$IP" to any port "$PORT" proto tcp
+        ;;
+    *)
+        IP="$1"; is_ip "$IP" || { echo "Некорректный IP: '$IP'"; exit 1; }
+        ufw allow from "$IP" to any port "$PORT" proto tcp comment 'Entry node -> bridge'
+        echo "Готово. Проверка с входящей ноды:"
+        echo "  bridge-check <IP_ЭТОГО_МОСТА> $PORT <SNI_МОСТА>"
+        ;;
+esac
+BALLOW
+chmod +x /usr/local/bin/bridge-allow
+fi
 
 # =============================================================================
 #  [12/12] РЕГЛАМЕНТНОЕ ОБСЛУЖИВАНИЕ
@@ -675,8 +859,17 @@ echo "Логин:            $USER_NAME"
 echo "Порт SSH:         $SSH_PORT"
 echo ""
 echo "--- Firewall ---"
+if [ "$NODE_ROLE" = "1" ]; then
 echo "443/tcp           открыт (Xray)"
 echo "443/udp           заблокирован (QUIC)"
+else
+if [ "${#ENTRY_IPS[@]}" -gt 0 ]; then
+echo "$BRIDGE_PORT/tcp          только с входящих нод: ${ENTRY_IPS[*]}"
+else
+echo "$BRIDGE_PORT/tcp          ЗАКРЫТ — входящие ноды не указаны!"
+fi
+echo "Добавить ноду:    sudo bridge-allow <IP>   (список: sudo bridge-allow -l)"
+fi
 echo "$NODE_PORT/tcp           только с $PANEL_IP (панель)"
 if [ "${#EXTRA_PORTS[@]}" -gt 0 ]; then
     echo "Доп. порты:       ${EXTRA_PORTS[*]}/tcp (открыты всем)"
@@ -693,9 +886,11 @@ echo "добавьте в конфиг Xray:"
 echo "    \"dns\": { \"queryStrategy\": \"UseIPv4\" }"
 echo "и замените domainStrategy UseIP/AsIs на UseIPv4 в freedom-outbound."
 echo ""
-echo "--- Параметры docker-compose (environment) ---"
+echo "--- Параметры Go-рантайма (docker-compose.override.yml) ---"
 echo "GOGC=$GOGC"
 echo "GOMEMLIMIT=$GOMEM"
+echo "Файл: /opt/remnanode/docker-compose.override.yml"
+echo "docker-compose.yml открывается пустым — вставьте compose из панели."
 echo ""
 if [ "$NODE_ROLE" = "1" ]; then
 echo "--- JSON: inbound 443 ---"
@@ -713,7 +908,7 @@ echo "scMaxBufferedPosts:     $SC_BUFF"
 echo "scMaxConcurrentPosts:   64"
 echo "scStreamUpServerSecs:   \"300\""
 else
-echo "--- JSON: inbound 8443 ---"
+echo "--- JSON: inbound $BRIDGE_PORT ---"
 echo "xmux.maxConcurrency:    \"512\""
 echo "xmux.hMaxRequestTimes:  \"1000-1500\""
 echo "xmux.hMaxReusableSecs:  \"300\""
@@ -728,6 +923,8 @@ echo ""
 echo "--- Диагностика ---"
 echo "Команда node-health покажет, что именно упёрлось:"
 echo "CPU, память, conntrack, соединения, полосу."
+echo "Доступность моста (запускать на входящей ноде):"
+echo "  bridge-check <IP_МОСТА> [ПОРТ] [SNI]"
 echo "====================================================================="
 } > "$REPORT"
 
@@ -741,7 +938,18 @@ cat "$REPORT"
 echo ""
 echo "====================================================================="
 warn "НЕ ЗАКРЫВАЙТЕ ЭТУ СЕССИЮ."
-read -r -p "Вход работает? Введите YES для закрытия порта 22: " CONFIRM
+
+# Если sshd не переехал на новый порт, единственный рабочий вход — 22.
+# Закрыть его в этом состоянии = потерять SSH (останется только консоль хостера).
+if [ "$SSH_PORT_OK" != true ]; then
+    warn "sshd НЕ слушает новый порт $SSH_PORT — порт 22 НЕ закрываю."
+    warn "Разберитесь с sshd (ss -tlnp | grep sshd), проверьте вход на $SSH_PORT, затем:"
+    warn "  ufw delete limit 22/tcp && ufw deny 22/tcp"
+    CONFIRM="SKIP"
+else
+    warn "Откройте НОВОЕ окно терминала и войдите: пользователь $USER_NAME, порт $SSH_PORT."
+    read -r -p "Вход в новом окне работает? Введите YES для закрытия порта 22: " CONFIRM
+fi
 
 if [ "$CONFIRM" = "YES" ]; then
     ufw delete limit 22/tcp >/dev/null 2>&1 || true
@@ -764,38 +972,47 @@ if [ -f docker-compose.yml ] && [ -s docker-compose.yml ]; then
     say "Существующий docker-compose.yml сохранён в бэкап, пишем заново."
 fi
 
-# В environment — только параметры, подобранные скриптом по железу
-# (GOGC/GOMEMLIMIT). Никаких плейсхолдеров под переменные панели
-# здесь больше нет — при необходимости добавьте их вручную в nano ниже.
-cat > docker-compose.yml <<EOF
+# docker-compose.yml открывается ПУСТЫМ: в него целиком вставляется compose
+# из панели Remnawave. Параметры Go-рантайма, подобранные по железу,
+# лежат отдельно в docker-compose.override.yml — Docker Compose сам
+# объединяет его с docker-compose.yml при любой команде в этой папке
+# (up, restart, cron-перезапуск). Лимиты логов уже заданы глобально
+# в /etc/docker/daemon.json, поэтому в compose они не нужны.
+: > docker-compose.yml
+
+cat > docker-compose.override.yml <<EOF
+# Создан install-node.sh — параметры Go-рантайма под железо этой ноды.
+# Docker Compose автоматически объединяет этот файл с docker-compose.yml.
 services:
   remnanode:
-    container_name: remnanode
-    hostname: remnanode
-    image: remnawave/node:latest
-    restart: always
-    network_mode: host
     environment:
       - GOGC=$GOGC
       - GOMEMLIMIT=$GOMEM
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
 EOF
-say "Создан docker-compose.yml с GOGC=$GOGC и GOMEMLIMIT=$GOMEM."
+say "GOGC=$GOGC и GOMEMLIMIT=$GOMEM записаны в docker-compose.override.yml."
 
 echo ""
-warn "Откроется nano. Если нужны дополнительные переменные (например, из панели) —"
-warn "добавьте их сами; если нет — просто закройте файл."
+warn "Откроется ПУСТОЙ docker-compose.yml."
+warn "Вставьте в него docker-compose из панели Remnawave целиком."
 warn "Сохранение: Ctrl+O, Enter, Ctrl+X."
 read -n 1 -s -r -p "Нажмите любую клавишу..."
 echo ""
 
 nano docker-compose.yml
 
-docker compose config >/dev/null || die "docker-compose.yml невалиден."
+if ! grep -q '[^[:space:]]' docker-compose.yml; then
+    die "docker-compose.yml пустой. Вставьте compose из панели и запустите: cd /opt/remnanode && nano docker-compose.yml && docker compose up -d"
+fi
+
+# Override рассчитан на сервис с именем remnanode (так его называет панель).
+# Если имя другое, объединение сломает конфиг — тогда убираем override.
+if ! docker compose -f docker-compose.yml config --services 2>/dev/null | grep -qx remnanode; then
+    warn "В compose из панели нет сервиса 'remnanode' — GOGC/GOMEMLIMIT не применятся."
+    warn "Добавьте их вручную в environment: GOGC=$GOGC, GOMEMLIMIT=$GOMEM"
+    rm -f docker-compose.override.yml
+fi
+
+docker compose config >/dev/null || die "docker-compose.yml невалиден. Исправьте: cd /opt/remnanode && nano docker-compose.yml"
 docker compose up -d
 
 say "Контейнер запущен. Отчёт: $REPORT"
