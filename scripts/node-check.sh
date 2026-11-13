@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  node-check — проверка ноды SG VPN (v1)
+#  node-check — проверка ноды SG VPN (v1.1)
+#
+#  v1.1: добавлены swap, диск и таблица conntrack — то, что раньше
+#  показывала утилита node-health; node-check её полностью заменяет.
 #
 #  Что делает: читает состояние сервера и Xray и сверяет его со стандартом.
 #  Ничего не меняет в работе ноды (кроме режима --install, который ставит
@@ -220,6 +223,19 @@ do_report() {
     avail="$(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {printf "%d", 100 * a / t}' /proc/meminfo)"
     if [ "$avail" -lt 15 ]; then warn "Свободной памяти осталось ${avail}%"
     else ok "Свободной памяти ${avail}%"; fi
+    local sw du ctc ctm
+    sw="$(awk '/^SwapTotal:/ {t = $2} /^SwapFree:/ {f = $2} END {printf "%d", (t - f) / 1024}' /proc/meminfo)"
+    if [ "${sw:-0}" -gt 200 ]; then warn "В swap ушло ${sw} МБ — серверу не хватает оперативной памяти"
+    else ok "Swap почти не используется (${sw:-0} МБ)"; fi
+    du="$(df -P / 2>/dev/null | awk 'NR == 2 {sub(/%/, "", $5); print $5}')"
+    if [ "${du:-0}" -gt 85 ]; then warn "Диск занят на ${du}%"
+    else ok "Диск занят на ${du:-?}%"; fi
+    ctc="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+    ctm="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+    if [ -n "$ctc" ] && [ "${ctm:-0}" -gt 0 ]; then
+        if [ $((100 * ctc / ctm)) -gt 80 ]; then warn "Таблица соединений ядра (conntrack) заполнена: $ctc из $ctm — новые соединения будут отбрасываться"
+        else ok "Таблица соединений ядра (conntrack): $ctc из $ctm"; fi
+    fi
 
     hdr "Качество сети"
     if gt "$RETR_PCT" "$MAX_RETR"; then warn "Повторных отправок пакетов ${RETR_PCT}% (порог ${MAX_RETR}%)"
