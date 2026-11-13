@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  mynode — единая точка входа для скриптов SG VPN  (v3)
+#  mynode — единая точка входа для скриптов SG VPN  (v3.1)
+#
+#  v3.1: команда bridge-check (scripts/bridge-check.sh) — ставится и на
+#  старые ноды, где её не было.
 #
 #  Изменения против v2:
 #   - Новые команды: check (проверка ноды, scripts/node-check.sh) и
@@ -65,6 +68,7 @@ mynode — управление нодами SG VPN
   install [опции]     Установка Linux-ноды (требует root)
   check [опции]       Проверка ноды (требует root)
   bench [опции]       Проверка сервера хостера (требует root)
+  bridge-check IP [ПОРТ] [SNI]  Доходит ли входящая нода до моста (требует root)
   scan [опции]        Поиск Reality-таргетов (Linux и macOS)
   self-install        Установить эту команду глобально как 'mynode'
   update              Обновить локальную копию до текущей версии из репозитория
@@ -152,6 +156,7 @@ run_tool() {
 
 cmd_check() { run_tool "scripts/node-check.sh" "node-check" "$@"; }
 cmd_bench() { run_tool "scripts/host-bench.sh" "host-bench" "$@"; }
+cmd_bridge_check() { run_tool "scripts/bridge-check.sh" "bridge-check" "$@"; }
 
 # --- Меню ---
 # Справа у каждого пункта — нагрузка, которую он создаёт на сервер.
@@ -192,8 +197,8 @@ MENU
             3)  ( cmd_check --install ) ;;
             4)  ( cmd_check --uninstall ) ;;
             5)  ip="$(ask 'IP моста: ')"; port="$(ask 'Порт моста [2087]: ')"; sni="$(ask 'SNI моста (можно пусто): ')"
-                if command -v bridge-check >/dev/null 2>&1; then ( bridge-check "$ip" "${port:-2087}" $sni )
-                else warn "bridge-check не установлен (ставится скриптом install)."; fi ;;
+                # shellcheck disable=SC2086
+                ( cmd_bridge_check "$ip" "${port:-2087}" $sni ) ;;
             6)  ( cmd_bench --quick ) ;;
             7)  ( cmd_bench ) ;;
             8)  ( cmd_bench --watch ) ;;
@@ -281,6 +286,7 @@ case "$1" in
     install)      shift; cmd_install "$@" ;;
     check)        shift; cmd_check "$@" ;;
     bench)        shift; cmd_bench "$@" ;;
+    bridge-check) shift; cmd_bridge_check "$@" ;;
     scan)         shift; cmd_scan "$@" ;;
     menu)         cmd_menu ;;
     self-install) cmd_self_install ;;

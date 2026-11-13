@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  node-check — проверка ноды SG VPN (v1.1)
+#  node-check — проверка ноды SG VPN (v1.2)
 #
+#  v1.2: предупреждение, если порт моста не открыт ни для одной входной
+#  ноды; проверка DNS внутри контейнера.
 #  v1.1: добавлены swap, диск и таблица conntrack — то, что раньше
 #  показывала утилита node-health; node-check её полностью заменяет.
 #
@@ -202,6 +204,12 @@ do_report() {
         elif [ "$rc" -gt 0 ]; then warn "Контейнер remnanode перезапускался сам: $rc раз"
         else ok "Контейнер remnanode сам не перезапускался"; fi
     fi
+    # Разрешает ли контейнер имена: без этого Reality не доходит до сайта
+    # маскировки (target задан именем) и мост обрывает каждое соединение.
+    if command -v docker >/dev/null 2>&1 && docker exec remnanode sh -c 'command -v getent' >/dev/null 2>&1; then
+        if docker exec remnanode getent hosts cloudflare.com >/dev/null 2>&1; then ok "Контейнер разрешает имена (DNS работает)"
+        else warn "Контейнер не разрешает имена (DNS): Reality с target в виде имени работать не будет — задайте target IP-адресом"; fi
+    fi
     local oom
     oom="$(journalctl -k --since '-24h' 2>/dev/null | grep -ciE 'out of memory|oom-kill')"
     if [ "${oom:-0}" -gt 0 ]; then warn "Нехватка памяти (OOM) за сутки: $oom записей в журнале ядра"
@@ -338,10 +346,14 @@ do_report() {
         if echo "$st" | grep -q '^Status: active'; then
             ok "ufw включён"
             if [ "$ROLE" = "bridge" ]; then
+                local allowed
+                allowed="$(echo "$st" | awk -v p="$BRIDGE_PORT/tcp" '$1 == p {f = ($3 == "IN") ? $4 : $3; print f}' | tr '\n' ' ')"
                 if echo "$st" | grep -E "^$BRIDGE_PORT/tcp" | grep -q 'Anywhere'; then
                     warn "Порт моста $BRIDGE_PORT открыт для всех — должен быть открыт только для входных нод"
+                elif [ -z "${allowed// /}" ]; then
+                    warn "Порт моста $BRIDGE_PORT не открыт ни для одной входной ноды — мост недоступен. Открыть: bridge-allow <IP_ВХОДНОЙ_НОДЫ>"
                 else
-                    ok "Порт моста $BRIDGE_PORT открыт только для: $(echo "$st" | awk -v p="$BRIDGE_PORT/tcp" '$1 == p {f = ($3 == "IN") ? $4 : $3; print f}' | tr '\n' ' ')"
+                    ok "Порт моста $BRIDGE_PORT открыт только для: $allowed"
                 fi
             fi
         else
