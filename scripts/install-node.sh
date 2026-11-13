@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v5)
+#  MASTER-СКРИПТ ПОДГОТОВКИ НОДЫ  (v6)
 #
-#  Изменения против v4:
+#  Изменения против v5:
+#   - Отчёт печатает стандарт Xray, подтверждённый суточным тестом 12-13.11.2026
+#     (xmux, keepalive, sniffing, IPv4 на выходе). Старые значения в отчёте
+#     (maxConcurrency, cMaxReuseTimes, sc*-поля, xmux в инбаунде моста)
+#     тестам противоречили и убраны.
+#   - Третья роль: самостоятельная нода — принимает клиентов и сама выходит
+#     в интернет, без моста.
+#   - Клиентские роли (1 и 3): спрашиваются порты gRPC и Vision
+#     (по умолчанию 2053 и 2083) и открываются в UFW.
+#   - GOGC=100 на любом железе: память Xray на всех нодах занимала 1-29%
+#     от GOMEMLIMIT, а GOMEMLIMIT страхует от нехватки памяти.
+#   - Вместо утилиты node-health ставится node-check (из репозитория)
+#     с ежечасным журналом замеров.
+#   - Повторный запуск на мосту сохраняет уже разрешённые входящие ноды
+#     (раньше сброс UFW стирал их список).
+#   - На ноду ставится команда mynode (меню со всеми действиями).
+#   - Отчёт заканчивается списком всех команд ноды с пояснениями.
+#
+#  Изменения v5 против v4:
 #   - Мост (роль 2): спрашивается порт инбаунда моста и IP входящих нод.
 #     Порт моста открывается в UFW ТОЛЬКО для этих IP. Раньше скрипт его
 #     не открывал вовсе: при default deny мост молча дропал SYN от RU-нод,
@@ -76,6 +94,10 @@ for arg in "$@"; do
     esac
 done
 
+# Откуда брать node-check. Совпадает с GH_USER/GH_REPO/GH_REF в mynode.sh.
+RAW_BASE="${MYNODE_RAW_BASE:-https://raw.githubusercontent.com/SilkTraders/sgvpn-scripts/main}"
+MIRROR_BASE="${MYNODE_MIRROR_BASE:-https://cdn.jsdelivr.net/gh/SilkTraders/sgvpn-scripts@main}"
+
 DEFAULT_PANEL_IP="${MYNODE_PANEL_IP:-}"
 DEFAULT_NODE_PORT="${MYNODE_NODE_PORT:-2222}"
 DEFAULT_BRIDGE_PORT="${MYNODE_BRIDGE_PORT:-2087}"
@@ -109,13 +131,18 @@ echo ""
 # =============================================================================
 
 echo "=== Роль сервера ==="
-echo "1) Входящая нода  — принимает трафик от пользователей"
-echo "2) Транзитный мост — принимает трафик только от входящей ноды"
+echo "1) Входящая нода        — принимает клиентов, трафик отдаёт на мост"
+echo "2) Транзитный мост       — принимает трафик только от входящей ноды"
+echo "3) Самостоятельная нода  — принимает клиентов и сама выходит в интернет"
 while true; do
-  read -r -p "Выберите цифру (1 или 2): " NODE_ROLE
-  [[ "$NODE_ROLE" =~ ^[12]$ ]] && break
-  warn "Введите 1 или 2."
+  read -r -p "Выберите цифру (1, 2 или 3): " NODE_ROLE
+  [[ "$NODE_ROLE" =~ ^[123]$ ]] && break
+  warn "Введите 1, 2 или 3."
 done
+# Роли 1 и 3 принимают клиентов: у них одинаковый файрвол и одинаковый
+# стандарт клиентских инбаундов.
+CLIENT_ROLE=false
+if [ "$NODE_ROLE" != "2" ]; then CLIENT_ROLE=true; fi
 
 while true; do
   read -r -p "Имя хоста (hostname): " HOST_NAME
@@ -229,11 +256,37 @@ if [ "$NODE_ROLE" = "2" ]; then
     fi
 fi
 
+# --- Порты gRPC и Vision (клиентские роли) ---
+# Номера не зашиты намертво: одинаковый набор портов на всех нодах сам
+# может стать приметой, поэтому их можно задать свои для каждой ноды.
+CLIENT_PORTS=()
+if [ "$CLIENT_ROLE" = true ]; then
+    echo ""
+    echo "=== Порты gRPC и Vision ==="
+    echo "443/tcp (XHTTP) открывается всегда. Здесь — порты инбаундов gRPC и Vision."
+    echo "Должны совпадать с \"port\" этих инбаундов в профиле Remnawave."
+    read -r -p "Порты через запятую [2053,2083] (0 = не открывать): " CLIENT_PORTS_INPUT
+    CLIENT_PORTS_INPUT="${CLIENT_PORTS_INPUT:-2053,2083}"
+    if [ "$CLIENT_PORTS_INPUT" != "0" ]; then
+        IFS=',' read -r -a RAW_PORTS <<< "$CLIENT_PORTS_INPUT"
+        for p in "${RAW_PORTS[@]}"; do
+            p="$(echo "$p" | xargs)"
+            [ -z "$p" ] && continue
+            if valid_port "$p" && [ "$p" != "$NODE_PORT" ] && [ "$p" != "443" ]; then
+                CLIENT_PORTS+=("$p")
+            else
+                warn "Порт '$p' некорректен или уже занят (443, порт панели), пропущен."
+            fi
+        done
+    fi
+fi
+
 # --- Дополнительные порты ---
 echo ""
 echo "=== Дополнительные порты ==="
-if [ "$NODE_ROLE" = "1" ]; then
+if [ "$CLIENT_ROLE" = true ]; then
     echo "Уже открываются автоматически: SSH-порт (см. ниже), 443/tcp (Xray),"
+    if [ "${#CLIENT_PORTS[@]}" -gt 0 ]; then echo "${CLIENT_PORTS[*]}/tcp (gRPC, Vision),"; fi
     echo "$NODE_PORT/tcp только с IP панели ($PANEL_IP)."
 else
     echo "Уже открываются автоматически: SSH-порт (см. ниже),"
@@ -285,17 +338,21 @@ echo "======================================"
 #  ПАРАМЕТРЫ ПО ЖЕЛЕЗУ
 # =============================================================================
 
-if   [ "$RAM_MB" -le 2300 ]; then GOMEM="1200MiB"; GOGC="30"; SC_BUFF="15"
-elif [ "$RAM_MB" -le 4600 ]; then GOMEM="2500MiB"; GOGC="50"; SC_BUFF="15"
-elif [ "$RAM_MB" -le 9200 ]; then GOMEM="6000MiB"; GOGC="50"; SC_BUFF="30"
-else                              GOMEM="12000MiB"; GOGC="60"; SC_BUFF="45"
+# GOMEMLIMIT — потолок памяти Xray под объём RAM. GOGC=100 (значение Go по
+# умолчанию) на любом железе: меньшие значения заставляют сборщик мусора
+# работать чаще и тратить процессор, а от нехватки памяти страхует GOMEMLIMIT.
+GOGC="100"
+if   [ "$RAM_MB" -le 2300 ]; then GOMEM="1200MiB"
+elif [ "$RAM_MB" -le 4600 ]; then GOMEM="2500MiB"
+elif [ "$RAM_MB" -le 9200 ]; then GOMEM="6000MiB"
+else                              GOMEM="12000MiB"
 fi
 
-if [ "$NODE_ROLE" = "1" ]; then
-    ROLE_NAME="ВХОДЯЩАЯ НОДА (Entry Node)"; CONN_IDLE="120"
-else
-    ROLE_NAME="ТРАНЗИТНЫЙ МОСТ (Transit Bridge)"; CONN_IDLE="300"
-fi
+case "$NODE_ROLE" in
+    1) ROLE_NAME="ВХОДЯЩАЯ НОДА (Entry Node)"; CONN_IDLE="120" ;;
+    2) ROLE_NAME="ТРАНЗИТНЫЙ МОСТ (Transit Bridge)"; CONN_IDLE="300" ;;
+    3) ROLE_NAME="САМОСТОЯТЕЛЬНАЯ НОДА (прямой выход)"; CONN_IDLE="300" ;;
+esac
 
 # =============================================================================
 #  [1/12] HOSTNAME
@@ -586,15 +643,32 @@ if [ -f "$UFW_BEFORE" ] && ! grep -q "XRAY-ICMP-HARDENING" "$UFW_BEFORE"; then
     sed -i '1i # XRAY-ICMP-HARDENING applied' "$UFW_BEFORE"
 fi
 
+# Повторный запуск на мосту: сброс UFW ниже стёр бы список входящих нод,
+# добавленных через bridge-allow. Забираем их из текущих правил заранее.
+KEPT_IPS=()
+if [ "$NODE_ROLE" = "2" ]; then
+    OLD_BRIDGE_PORT="$(cat /etc/sgvpn/bridge-port 2>/dev/null || echo "$BRIDGE_PORT")"
+    while read -r old_ip; do
+        valid_ipv4 "$old_ip" || continue
+        if [[ " ${ENTRY_IPS[*]} " != *" $old_ip "* ]]; then
+            ENTRY_IPS+=("$old_ip"); KEPT_IPS+=("$old_ip")
+        fi
+    done < <(ufw status 2>/dev/null | awk -v p="$OLD_BRIDGE_PORT/tcp" '$1 == p && $2 == "ALLOW" {print $3}')
+    if [ "${#KEPT_IPS[@]}" -gt 0 ]; then say "Сохранены ранее разрешённые входящие ноды: ${KEPT_IPS[*]}"; fi
+fi
+
 ufw --force reset >/dev/null 2>&1
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 
 ufw limit "$SSH_PORT"/tcp comment 'SSH'
 
-if [ "$NODE_ROLE" = "1" ]; then
+if [ "$CLIENT_ROLE" = true ]; then
     ufw allow 443/tcp comment 'Xray inbound'
     ufw deny  443/udp comment 'Block QUIC'
+    for p in "${CLIENT_PORTS[@]}"; do
+        ufw allow "$p"/tcp comment 'Xray gRPC/Vision'
+    done
 else
     # Мост: порт инбаунда — только для входящих нод. Без этого правила
     # default deny молча дропает SYN от RU-нод (ни RST, ни ошибки в панели).
@@ -633,66 +707,42 @@ usermod -aG docker "$USER_NAME"
 # =============================================================================
 #  [11/12] УТИЛИТА ДИАГНОСТИКИ
 # =============================================================================
-say "[11/12] Утилита node-health..."
+say "[11/12] Утилиты диагностики..."
 
-cat > /usr/local/bin/node-health <<'HEALTH'
-#!/usr/bin/env bash
-# Быстрая диагностика ноды. Отвечает на вопрос "что именно упёрлось".
-CORES="$(nproc)"
-LA="$(awk '{print $1, $2, $3}' /proc/loadavg)"
-LA1="$(awk '{print $1}' /proc/loadavg)"
-LA_PCT="$(echo "scale=0; $LA1 * 100 / $CORES" | bc 2>/dev/null || echo "?")"
-
-echo "=============================================="
-echo " NODE HEALTH — $(date -u '+%Y-%m-%d %H:%M UTC')"
-echo "=============================================="
-echo ""
-echo "--- CPU ---"
-echo "Ядер:              $CORES"
-echo "Load Average:      $LA"
-echo "LA1 на ядро:       ${LA_PCT}%   (>100% = очередь на CPU)"
-echo ""
-echo "--- Память ---"
-echo "Значение имеет колонка available, а не used:"
-free -h
-echo ""
-echo "--- Swap ---"
-swapon --show 2>/dev/null || echo "swap не используется"
-echo ""
-echo "--- Conntrack ---"
-CT_CUR="$(conntrack -C 2>/dev/null || echo '?')"
-CT_MAX="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '?')"
-echo "Соединений: $CT_CUR из $CT_MAX"
-echo ""
-echo "--- Сетевые соединения ---"
-echo "ESTABLISHED: $(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)"
-echo "TIME-WAIT:   $(ss -tn state time-wait 2>/dev/null | tail -n +2 | wc -l)"
-echo ""
-echo "--- Диск ---"
-df -h / | tail -n 1
-echo ""
-echo "--- Контейнеры ---"
-docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" 2>/dev/null || echo "docker недоступен"
-echo ""
-echo "--- Полоса (5 сек) ---"
-IFACE="$(ip route | awk '/default/ {print $5; exit}')"
-if [ -n "$IFACE" ]; then
-    R1=$(cat "/sys/class/net/$IFACE/statistics/rx_bytes")
-    T1=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes")
-    sleep 5
-    R2=$(cat "/sys/class/net/$IFACE/statistics/rx_bytes")
-    T2=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes")
-    echo "Интерфейс $IFACE:"
-    echo "  RX: $(( (R2-R1)*8/5/1000000 )) Mbit/s"
-    echo "  TX: $(( (T2-T1)*8/5/1000000 )) Mbit/s"
-    echo "  Если упирается в круглое число (100/200/300) — это лимит тарифа,"
-    echo "  и ни перезапуск, ни ребут тут не помогут."
+# --- node-check: проверка ноды и ежечасный журнал замеров ---
+# Берётся из репозитория (сначала GitHub, при неудаче — зеркало jsDelivr).
+# Если скачать не вышло, установка продолжается: поставить позже можно
+# командой "mynode check --install".
+NODE_CHECK="/usr/local/sbin/node-check"
+NODE_CHECK_OK=false
+NC_TMP="$(mktemp)"
+if curl -fsSL --max-time 20 -o "$NC_TMP" "$RAW_BASE/scripts/node-check.sh" 2>/dev/null \
+   || curl -fsSL --max-time 20 -o "$NC_TMP" "$MIRROR_BASE/scripts/node-check.sh" 2>/dev/null; then
+    if head -n 1 "$NC_TMP" | grep -q '^#!'; then
+        install -m 755 "$NC_TMP" "$NODE_CHECK"
+        echo "0 * * * * root $NODE_CHECK --log" > /etc/cron.d/node-check
+        NODE_CHECK_OK=true
+        say "node-check установлен, ежечасный журнал включён."
+    fi
 fi
-echo ""
-echo "=============================================="
-HEALTH
+rm -f "$NC_TMP"
+if [ "$NODE_CHECK_OK" != true ]; then warn "node-check скачать не удалось. Позже: mynode check --install"; fi
+# Утилита прошлых версий: её заменяет node-check.
+rm -f /usr/local/bin/node-health
 
-chmod +x /usr/local/bin/node-health
+# --- mynode: меню и команды check / bench / scan прямо на ноде ---
+MYNODE_OK=false
+MN_TMP="$(mktemp)"
+if curl -fsSL --max-time 20 -o "$MN_TMP" "$RAW_BASE/mynode.sh" 2>/dev/null \
+   || curl -fsSL --max-time 20 -o "$MN_TMP" "$MIRROR_BASE/mynode.sh" 2>/dev/null; then
+    if head -n 1 "$MN_TMP" | grep -q '^#!'; then
+        install -m 755 "$MN_TMP" /usr/local/bin/mynode
+        MYNODE_OK=true
+        say "Команда mynode установлена."
+    fi
+fi
+rm -f "$MN_TMP"
+if [ "$MYNODE_OK" != true ]; then warn "mynode скачать не удалось — меню на ноде не будет, остальное работает."; fi
 
 # --- bridge-check: ставится на любую ноду, запускается на ВХОДЯЩЕЙ ---
 # Проверяет то, что панель не видит: доходит ли TCP от этой ноды до моста
@@ -859,9 +909,12 @@ echo "Логин:            $USER_NAME"
 echo "Порт SSH:         $SSH_PORT"
 echo ""
 echo "--- Firewall ---"
-if [ "$NODE_ROLE" = "1" ]; then
-echo "443/tcp           открыт (Xray)"
+if [ "$CLIENT_ROLE" = true ]; then
+echo "443/tcp           открыт (Xray, XHTTP)"
 echo "443/udp           заблокирован (QUIC)"
+if [ "${#CLIENT_PORTS[@]}" -gt 0 ]; then
+echo "${CLIENT_PORTS[*]}/tcp   открыты (gRPC, Vision)"
+fi
 else
 if [ "${#ENTRY_IPS[@]}" -gt 0 ]; then
 echo "$BRIDGE_PORT/tcp          только с входящих нод: ${ENTRY_IPS[*]}"
@@ -892,39 +945,77 @@ echo "GOMEMLIMIT=$GOMEM"
 echo "Файл: /opt/remnanode/docker-compose.override.yml"
 echo "docker-compose.yml открывается пустым — вставьте compose из панели."
 echo ""
-if [ "$NODE_ROLE" = "1" ]; then
-echo "--- JSON: inbound 443 ---"
-echo "xmux.maxConcurrency:    \"8\""
-echo "xmux.cMaxReuseTimes:    64"
-echo "xmux.hMaxRequestTimes:  \"400-600\""
-echo "xmux.hMaxReusableSecs:  \"120\""
-echo "scStreamUpServerSecs:   \"120\""
+echo "=== СТАНДАРТ XRAY (проверен суточным тестом 12-13.11.2026) ==="
+echo "Общее для всех инбаундов:"
+echo "  sniffing:   \"enabled\": true, \"routeOnly\": false, \"metadataOnly\": false"
+echo "  XHTTP:      \"mode\": \"auto\"; поля sc* не задавать"
 echo ""
-echo "--- JSON: outbound BRIDGE ---"
-echo "xmux.maxConcurrency:    \"512\""
-echo "xmux.hMaxRequestTimes:  \"1000-1500\""
-echo "xmux.hMaxReusableSecs:  \"300\""
-echo "scMaxBufferedPosts:     $SC_BUFF"
-echo "scMaxConcurrentPosts:   64"
-echo "scStreamUpServerSecs:   \"300\""
-else
-echo "--- JSON: inbound $BRIDGE_PORT ---"
-echo "xmux.maxConcurrency:    \"512\""
-echo "xmux.hMaxRequestTimes:  \"1000-1500\""
-echo "xmux.hMaxReusableSecs:  \"300\""
-echo "scMaxBufferedPosts:     $SC_BUFF"
-echo "scMaxConcurrentPosts:   64"
-echo "scStreamUpServerSecs:   \"300\""
+if [ "$CLIENT_ROLE" = true ]; then
+echo "--- Клиентские инбаунды (XHTTP 443, gRPC, Vision) ---"
+echo "sockopt в streamSettings КАЖДОГО клиентского инбаунда:"
+echo "  \"tcpKeepAliveIdle\": 60, \"tcpKeepAliveInterval\": 15"
+echo "xmux в extra инбаунда XHTTP (уходит клиентам в подписку):"
+echo "  \"xmux\": {\"maxConnections\": \"2-3\", \"hMaxReusableSecs\": \"900-1800\"}"
+echo "xPaddingBytes клиента должен лежать внутри диапазона сервера."
+echo ""
 fi
+if [ "$NODE_ROLE" = "1" ]; then
+echo "--- Outbound к мосту ---"
+echo "  \"xmux\": {\"maxConnections\": \"8-12\", \"hKeepAlivePeriod\": 15, \"hMaxReusableSecs\": \"600-1200\"}"
 echo ""
-echo "--- JSON: policy ---"
+echo "--- Маршрутизация ---"
+echo "После правила geoip:ru -> DIRECT добавить правило по доменам -> DIRECT:"
+echo "  geosite:category-ru, domain:ru, domain:su, domain:рф"
+echo ""
+fi
+if [ "$NODE_ROLE" = "2" ]; then
+echo "--- Инбаунд моста (порт $BRIDGE_PORT) ---"
+echo "xmux в инбаунде моста НЕ задавать: он работает только на стороне клиента,"
+echo "то есть в outbound входящей ноды."
+echo ""
+fi
+if [ "$NODE_ROLE" != "1" ]; then
+echo "--- Выход в интернет: только IPv4 ---"
+echo "  \"dns\":  { \"queryStrategy\": \"UseIPv4\" }"
+echo "  DIRECT (freedom): \"settings\": { \"domainStrategy\": \"UseIPv4\" }"
+echo ""
+fi
+echo "--- policy ---"
 echo "connIdle: $CONN_IDLE"
 echo ""
-echo "--- Диагностика ---"
-echo "Команда node-health покажет, что именно упёрлось:"
-echo "CPU, память, conntrack, соединения, полосу."
-echo "Доступность моста (запускать на входящей ноде):"
-echo "  bridge-check <IP_МОСТА> [ПОРТ] [SNI]"
+echo "=== КОМАНДЫ НА ЭТОЙ НОДЕ (все — под root: sudo -i) ==="
+echo ""
+echo "--- Проверка ноды (нагрузку не создаёт) ---"
+echo "mynode                        меню со всеми действиями"
+echo "node-check                    отчёт: нагрузка, соединения, настройки, файрвол"
+echo "node-check --history          журнал ежечасных замеров (время в UTC, Москва = +3 часа)"
+echo "node-check --uninstall        выключить ежечасные замеры (--install — включить)"
+echo ""
+echo "--- Тест хостера ---"
+echo "mynode bench --quick          паспорт сервера, сеть, IP — без нагрузки на процессор"
+echo "mynode bench                  полный тест: около 35 секунд грузит ВСЕ ядра"
+echo ""
+if [ "$NODE_ROLE" = "1" ]; then
+echo "--- Мост ---"
+echo "bridge-check <IP_МОСТА> [ПОРТ] [SNI]   доходит ли эта нода до моста"
+echo ""
+fi
+if [ "$NODE_ROLE" = "2" ]; then
+echo "--- Доступ входящих нод к мосту ---"
+echo "bridge-allow <IP>             открыть порт моста для входящей ноды"
+echo "bridge-allow -l               показать, для кого порт открыт"
+echo "bridge-allow -d <IP>          закрыть порт моста для ноды"
+echo ""
+fi
+echo "--- Контейнер ноды (папка /opt/remnanode) ---"
+echo "cd /opt/remnanode && docker compose up -d     применить изменения в compose-файлах"
+echo "cd /opt/remnanode && docker compose restart   перезапустить ноду"
+echo "docker logs remnanode --tail 50               последние строки журнала ноды"
+echo ""
+echo "--- Сервер ---"
+echo "ufw status numbered           правила файрвола"
+echo "cat $REPORT   показать этот отчёт ещё раз"
+echo "mynode update                 обновить команду mynode из репозитория"
 echo "====================================================================="
 } > "$REPORT"
 
@@ -1016,4 +1107,4 @@ docker compose config >/dev/null || die "docker-compose.yml невалиден. 
 docker compose up -d
 
 say "Контейнер запущен. Отчёт: $REPORT"
-say "Диагностика: node-health"
+say "Диагностика: node-check"
